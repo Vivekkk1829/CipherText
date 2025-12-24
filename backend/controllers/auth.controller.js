@@ -1,6 +1,6 @@
 const User = require("../models/User.js");
 const bcrypt = require("bcrypt");
-const jwt = require("jsonwebtoken")
+const jwt = require("jsonwebtoken");
 
 const loginUser = async (req, res) => {
   try {
@@ -53,7 +53,6 @@ const loginUser = async (req, res) => {
         userName: checkUser.userName,
       },
     });
-
   } catch (error) {
     console.log(error);
     return res.status(500).json({
@@ -107,4 +106,16 @@ const registerUser = async (req, res) => {
   }
 };
 
-module.exports = { loginUser, registerUser };
+const logoutUser = async (req, res) => {
+  res.clearCookie("token", {
+    httpOnly: true,
+    secure: true,
+    sameSite: "none",
+  });
+  return res.status(200).json({
+    success: true,
+    message: "Logged out successfully",
+  });
+};
+
+module.exports = { loginUser, registerUser ,logoutUser};
