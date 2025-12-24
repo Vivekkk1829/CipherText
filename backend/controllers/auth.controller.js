@@ -14,7 +14,7 @@ const loginUser = async (req, res) => {
 
     const checkUser = await User.findOne({ email });
     if (!checkUser) {
-      res.status(404).json({
+      return res.status(404).json({
         success: false,
         message: "User doesnot Exist",
       });
@@ -87,7 +87,7 @@ const registerUser = async (req, res) => {
     }
     const hashPassword = await bcrypt.hash(password, 10);
 
-    const newUser = User.create({
+    const newUser = await User.create({
       userName,
       email,
       password: hashPassword,
