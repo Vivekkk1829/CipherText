@@ -1,6 +1,7 @@
 const express = require("express");
 const app = express();
 const cors = require("cors");
+app.use(express.json());
 const cookieParser = require("cookie-parser");
 
 const authRouter = require("./routes/auth.router.js");
@@ -18,7 +19,7 @@ app.use(
   })
 );
 
-app.use(express.json());
+
 
 app.get("/", (req, res) => {
   res.send("Hello World");
