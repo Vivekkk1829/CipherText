@@ -5,14 +5,12 @@ const Message = require("../models/Message.js");
 --------------------------------------------------*/
 const sendMessage = async (req, res) => {
   try {
-    // values coming from auth + route
+
     const sender = req.user._id;
     const receiver = req.params.userId || req.params.id;
 
-    // body MUST send `content`
     const { content } = req.body;
 
-    // validation
     if (!content || !content.trim()) {
       return res.status(400).json({
         success: false,
@@ -20,7 +18,6 @@ const sendMessage = async (req, res) => {
       });
     }
 
-    // persist message (SOURCE OF TRUTH)
     const message = await Message.create({
       sender,
       receiver,
@@ -29,6 +26,10 @@ const sendMessage = async (req, res) => {
       status: "sent",
       isEncrypted: false,
     });
+
+    const io = req.app.get("io");
+    io.to(receiver.toString()).emit("new_message", message);
+    io.to(sender.toString()).emit("message_sent", message);
 
     return res.status(201).json({
       success: true,
@@ -44,9 +45,6 @@ const sendMessage = async (req, res) => {
   }
 };
 
-/* -------------------------------------------------
-   GET MESSAGES (HTTP ONLY)
---------------------------------------------------*/
 const getMessages = async (req, res) => {
   try {
     const myId = req.user._id;
@@ -78,6 +76,8 @@ const getMessages = async (req, res) => {
       },
       { $set: { status: "seen" } }
     );
+
+    
 
     return res.json({
       success: true,

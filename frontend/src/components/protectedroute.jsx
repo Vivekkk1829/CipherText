@@ -1,5 +1,6 @@
 import { useEffect, useState } from "react";
 import { Navigate, Outlet } from "react-router-dom";
+import { connectSocket, disconnectSocket } from "../api/socket";
 import api from "../api/axios";
 
 export default function ProtectedRoute() {
@@ -11,8 +12,14 @@ export default function ProtectedRoute() {
     const checkAuth = async () => {
       try {
         const res = await api.get("/auth/me");
-        setUser(res.data.user); 
+
+        const userData = res.data.user;
+
+        setUser(userData);
         setAuthorized(true);
+
+        connectSocket(userData._id);
+
       } catch (err) {
         setAuthorized(false);
       } finally {
@@ -21,9 +28,13 @@ export default function ProtectedRoute() {
     };
 
     checkAuth();
+
+    return () => {
+      disconnectSocket();
+    };
   }, []);
 
-  if (loading) return null; // or loader
+  if (loading) return null;
 
   if (!authorized) {
     return <Navigate to="/" replace />;

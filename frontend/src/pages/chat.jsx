@@ -1,30 +1,33 @@
-import { useEffect, useState } from "react";
+import { useEffect, useLayoutEffect, useRef, useState } from "react";
 import { useOutletContext, useNavigate } from "react-router-dom";
 import api from "../api/axios";
+import { getSocket } from "../api/socket";
 
 export default function Chat() {
   const { user } = useOutletContext();
   const navigate = useNavigate();
 
-  const [sidebarOpen, setSidebarOpen] = useState(false);
-  const [showProfile, setShowProfile] = useState(false);
+  const chatRef = useRef(null);
+  const lastMessageRef = useRef(null);
+
+  const [showMyProfile, setShowMyProfile] = useState(false);
 
   const [users, setUsers] = useState([]);
   const [loadingUsers, setLoadingUsers] = useState(true);
 
   const [selectedUser, setSelectedUser] = useState(null);
+
   const [messages, setMessages] = useState([]);
   const [messageText, setMessageText] = useState("");
+
   const [loadingMessages, setLoadingMessages] = useState(false);
+  const [loadingMore, setLoadingMore] = useState(false);
+  const [nextCursor, setNextCursor] = useState(null);
 
   /* ---------------- LOGOUT ---------------- */
   const handleLogout = async () => {
-    try {
-      await api.post("/auth/logout");
-      navigate("/", { replace: true });
-    } catch (err) {
-      console.error("Logout failed", err);
-    }
+    await api.post("/auth/logout");
+    navigate("/", { replace: true });
   };
 
   /* ---------------- FETCH USERS ---------------- */
@@ -33,8 +36,6 @@ export default function Chat() {
       try {
         const res = await api.get("/getUsers");
         setUsers(res.data.users);
-      } catch (err) {
-        console.error("Failed to fetch users", err);
       } finally {
         setLoadingUsers(false);
       }
@@ -44,69 +45,108 @@ export default function Chat() {
 
   /* ---------------- FETCH MESSAGES ---------------- */
   const fetchMessages = async (userId) => {
-    try {
-      setLoadingMessages(true);
-      const res = await api.get(`/messages/${userId}`);
-      setMessages(res.data.messages);
-    } catch (err) {
-      console.error("Failed to fetch messages", err);
-    } finally {
-      setLoadingMessages(false);
-    }
+    setLoadingMessages(true);
+    setMessages([]);
+    setNextCursor(null);
+
+    const res = await api.get(`/messages/${userId}`);
+    setMessages(res.data.messages);
+    setNextCursor(res.data.nextCursor);
+
+    setLoadingMessages(false);
+  };
+
+  /* ---------------- FETCH OLDER MESSAGES ---------------- */
+  const fetchOlderMessages = async () => {
+    if (!nextCursor || loadingMore) return;
+
+    setLoadingMore(true);
+    const prevHeight = chatRef.current.scrollHeight;
+
+    const res = await api.get(
+      `/messages/${selectedUser._id}?cursor=${nextCursor}`
+    );
+
+    setMessages((prev) => [...res.data.messages, ...prev]);
+    setNextCursor(res.data.nextCursor);
+
+    requestAnimationFrame(() => {
+      const newHeight = chatRef.current.scrollHeight;
+      chatRef.current.scrollTop = newHeight - prevHeight;
+    });
+
+    setLoadingMore(false);
   };
 
   /* ---------------- SEND MESSAGE ---------------- */
   const handleSendMessage = async () => {
-    if (!messageText.trim() || !selectedUser) return;
+    if (!messageText.trim()) return;
 
-    try {
-      const res = await api.post(`/messages/${selectedUser._id}`, {
-        content: messageText, // MUST match backend
+    // ✅ ONLY HTTP persistence
+    await api.post(`/messages/${selectedUser._id}`, {
+      content: messageText,
+    });
+
+    // ✅ UI updates via socket ONLY
+    setMessageText("");
+  };
+
+  /* ---------------- AUTO SCROLL ---------------- */
+  useLayoutEffect(() => {
+    if (lastMessageRef.current) {
+      lastMessageRef.current.scrollIntoView({
+        behavior: "auto",
+        block: "end",
       });
+    }
+  }, [messages]);
 
-      setMessages((prev) => [...prev, res.data.message]);
-      setMessageText("");
-    } catch (err) {
-      console.error("Failed to send message", err);
+  /* ---------------- SCROLL HANDLER ---------------- */
+  const handleScroll = () => {
+    if (chatRef.current.scrollTop === 0) {
+      fetchOlderMessages();
     }
   };
+
+  /* ---------------- SOCKET LISTENERS ---------------- */
+  useEffect(() => {
+    const socket = getSocket();
+    if (!socket || !selectedUser) return;
+
+    const handleNewMessage = (message) => {
+      if (
+        message.sender === selectedUser._id ||
+        message.receiver === selectedUser._id
+      ) {
+        setMessages((prev) => [...prev, message]);
+      }
+    };
+
+    const handleMessageSent = (message) => {
+      if (message.receiver === selectedUser._id) {
+        setMessages((prev) => [...prev, message]);
+      }
+    };
+
+    socket.on("new_message", handleNewMessage);
+    socket.on("message_sent", handleMessageSent);
+
+    return () => {
+      socket.off("new_message", handleNewMessage);
+      socket.off("message_sent", handleMessageSent);
+    };
+  }, [selectedUser]);
 
   return (
     <div className="h-screen flex bg-slate-950 text-white overflow-hidden">
 
-      {/* MOBILE OVERLAY */}
-      {sidebarOpen && (
-        <div
-          className="fixed inset-0 bg-black/60 z-30 lg:hidden"
-          onClick={() => setSidebarOpen(false)}
-        />
-      )}
-
       {/* LEFT SIDEBAR */}
-      <aside
-        className={`
-          fixed lg:static z-40
-          h-full w-72
-          bg-slate-900 border-r border-slate-800
-          transform transition-transform duration-300
-          ${sidebarOpen ? "translate-x-0" : "-translate-x-full"}
-          lg:translate-x-0
-        `}
-      >
-        <div className="p-4 border-b border-slate-800 flex justify-between items-center">
-          <div>
-            <h2 className="text-lg font-semibold">CipherText</h2>
-            <p className="text-xs text-slate-400">Secure Messaging</p>
-          </div>
-          <button
-            className="lg:hidden text-slate-400"
-            onClick={() => setSidebarOpen(false)}
-          >
-            ✕
-          </button>
+      <aside className="w-72 bg-slate-900 border-r border-slate-800 hidden lg:block">
+        <div className="p-4 border-b border-slate-800">
+          <h2 className="font-semibold">CipherText</h2>
         </div>
 
-        <div className="flex-1 overflow-y-auto">
+        <div className="overflow-y-auto">
           {loadingUsers ? (
             <p className="p-4 text-slate-400">Loading users...</p>
           ) : (
@@ -116,9 +156,8 @@ export default function Chat() {
                 onClick={() => {
                   setSelectedUser(u);
                   fetchMessages(u._id);
-                  setSidebarOpen(false);
                 }}
-                className={`px-4 py-3 cursor-pointer hover:bg-slate-800 transition ${
+                className={`px-4 py-3 cursor-pointer hover:bg-slate-800 ${
                   selectedUser?._id === u._id ? "bg-slate-800" : ""
                 }`}
               >
@@ -130,109 +169,102 @@ export default function Chat() {
         </div>
       </aside>
 
-      {/* RIGHT CHAT AREA */}
+      {/* RIGHT CHAT */}
       <section className="flex-1 flex flex-col">
 
         {/* TOP BAR */}
-        <header className="h-16 border-b border-slate-800 flex items-center justify-between px-4 sm:px-6 bg-slate-900">
-          <div className="flex items-center gap-3">
-            <button
-              className="lg:hidden text-xl"
-              onClick={() => setSidebarOpen(true)}
-            >
-              ☰
-            </button>
+        <header className="h-16 border-b border-slate-800 flex items-center justify-between px-4 bg-slate-900">
+          <p className="font-medium">
+            {selectedUser ? selectedUser.userName : "Select a chat"}
+          </p>
 
-            <div className="w-10 h-10 rounded-full bg-cyan-500 flex items-center justify-center font-semibold">
-              {(selectedUser || user).userName[0].toUpperCase()}
+          <div
+            className="relative"
+            onMouseEnter={() => setShowMyProfile(true)}
+            onMouseLeave={() => setShowMyProfile(false)}
+          >
+            <div className="flex items-center gap-2 cursor-pointer">
+              <div className="w-8 h-8 rounded-full bg-cyan-500 flex items-center justify-center text-slate-900 font-bold">
+                {user.userName.charAt(0).toUpperCase()}
+              </div>
             </div>
 
-            <div>
-              <p className="font-medium">
-                {selectedUser ? selectedUser.userName : user.userName}
-              </p>
-              <p className="text-xs text-green-400">
-                {selectedUser ? "Chatting" : "Online"}
-              </p>
-            </div>
-          </div>
-
-          {/* PROFILE + LOGOUT */}
-          <div className="flex items-center gap-4">
-            <div
-              className="relative"
-              onMouseEnter={() => setShowProfile(true)}
-              onMouseLeave={() => setShowProfile(false)}
-            >
-              <button className="text-slate-400 hover:text-white">
-                Profile
-              </button>
-
-              {showProfile && (
-                <div className="absolute right-0 mt-2 w-56 bg-slate-900 border border-slate-800 rounded-lg shadow-xl p-4 z-50">
-                  <p className="text-sm font-semibold">{user.userName}</p>
-                  <p className="text-xs text-slate-400 mt-1">{user.email}</p>
-                </div>
-              )}
-            </div>
-
-            <button
-              onClick={handleLogout}
-              className="bg-red-500/20 text-red-400 px-3 py-1 rounded hover:bg-red-500/30"
-            >
-              Logout
-            </button>
+            {showMyProfile && (
+              <div className="absolute right-0 top-10 z-50 w-64 bg-slate-800 border border-slate-700 rounded-lg shadow-lg p-4">
+                <p className="font-semibold text-white">{user.userName}</p>
+                <p className="text-sm text-slate-400 mb-3">{user.email}</p>
+                <button
+                  onClick={handleLogout}
+                  className="w-full text-left text-red-400 hover:underline"
+                >
+                  Logout
+                </button>
+              </div>
+            )}
           </div>
         </header>
 
         {/* MESSAGES */}
-        <div className="flex-1 overflow-y-auto p-4 space-y-3">
+        <div
+          ref={chatRef}
+          onScroll={handleScroll}
+          className="flex-1 overflow-y-auto p-4 space-y-3"
+        >
           {!selectedUser ? (
-            <p className="text-slate-400 text-center mt-10">
+            <p className="text-center text-slate-400 mt-10">
               Select a user to start chatting
             </p>
           ) : loadingMessages ? (
             <p className="text-slate-400">Loading messages...</p>
           ) : (
-            messages.map((msg) => {
-              const isMine = msg.sender.toString() === user._id;
+            <>
+              {loadingMore && (
+                <p className="text-center text-xs text-slate-500">
+                  Loading older messages...
+                </p>
+              )}
 
-              return (
-                <div
-                  key={msg._id}
-                  className={`flex ${
-                    isMine ? "justify-end" : "justify-start"
-                  }`}
-                >
+              {messages.map((msg, index) => {
+                const isMine = msg.sender === user._id;
+                const isLast = index === messages.length - 1;
+
+                return (
                   <div
-                    className={`px-4 py-2 rounded-lg max-w-md ${
-                      isMine
-                        ? "bg-cyan-500 text-slate-900"
-                        : "bg-slate-800"
+                    key={msg._id}
+                    ref={isLast ? lastMessageRef : null}
+                    className={`flex ${
+                      isMine ? "justify-end" : "justify-start"
                     }`}
                   >
-                    {msg.content}
+                    <div
+                      className={`px-4 py-2 rounded-lg max-w-md ${
+                        isMine
+                          ? "bg-cyan-500 text-slate-900"
+                          : "bg-slate-800"
+                      }`}
+                    >
+                      {msg.content}
+                    </div>
                   </div>
-                </div>
-              );
-            })
+                );
+              })}
+            </>
           )}
         </div>
 
-        {/* MESSAGE INPUT */}
+        {/* INPUT */}
         {selectedUser && (
           <div className="border-t border-slate-800 p-4 bg-slate-900 flex gap-3">
             <input
-              type="text"
               value={messageText}
               onChange={(e) => setMessageText(e.target.value)}
-              placeholder="Type a message..."
-              className="flex-1 bg-slate-800 px-4 py-2 rounded text-white focus:outline-none"
               onKeyDown={(e) => e.key === "Enter" && handleSendMessage()}
+              className="flex-1 bg-slate-800 px-4 py-2 rounded outline-none"
+              placeholder="Type a message..."
             />
             <button
               onClick={handleSendMessage}
-              className="bg-cyan-400 text-slate-900 px-4 py-2 rounded hover:bg-cyan-300"
+              className="bg-cyan-400 text-black px-4 py-2 rounded"
             >
               Send
             </button>
