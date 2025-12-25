@@ -14,9 +14,15 @@ const messageSchema = new mongoose.Schema(
       required: true,
     },
 
+
     content: {
       type: String,
       required: true,
+    },
+
+    iv: {
+      type: String,
+      default: null,
     },
 
     type: {
@@ -30,6 +36,7 @@ const messageSchema = new mongoose.Schema(
       enum: ["sent", "delivered", "seen"],
       default: "sent",
     },
+
 
     isEncrypted: {
       type: Boolean,

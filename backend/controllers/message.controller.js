@@ -5,11 +5,11 @@ const Message = require("../models/Message.js");
 --------------------------------------------------*/
 const sendMessage = async (req, res) => {
   try {
-
     const sender = req.user._id;
     const receiver = req.params.userId || req.params.id;
 
-    const { content } = req.body;
+    // 1. NOW ACCEPT 'iv' FROM FRONTEND
+    const { content, iv } = req.body;
 
     if (!content || !content.trim()) {
       return res.status(400).json({
@@ -18,33 +18,53 @@ const sendMessage = async (req, res) => {
       });
     }
 
+    if (!iv) {
+        // Security Check: If frontend forgets to encrypt, reject it.
+        return res.status(400).json({
+            success: false,
+            message: "Encryption IV is missing. Secure message required.",
+        });
+    }
+
+    // 2. SAVE MESSAGE WITH IV
     const message = await Message.create({
       sender,
       receiver,
       content,
+      iv, // <--- CRITICAL: Save the randomness or decryption fails
       type: "text",
       status: "sent",
-      isEncrypted: false,
+      isEncrypted: true, // <--- Encryption is now ACTIVE
     });
 
-    const io = req.app.get("io");
-    io.to(receiver.toString()).emit("new_message", message);
-    io.to(sender.toString()).emit("message_sent", message);
-
-    return res.status(201).json({
+    // 3. SEND RESPONSE FAST (Don't wait for socket)
+    res.status(201).json({
       success: true,
       message,
     });
 
+    // 4. SOCKET EMIT (Background)
+    const io = req.app.get("io");
+    if (io) {
+        io.to(receiver.toString()).emit("new_message", message);
+        io.to(sender.toString()).emit("message_sent", message);
+    }
+
   } catch (error) {
     console.error("Send message error:", error);
-    return res.status(500).json({
-      success: false,
-      message: "Failed to send message",
-    });
+    // Safety check: Only send error if response wasn't sent
+    if (!res.headersSent) {
+        return res.status(500).json({
+            success: false,
+            message: "Failed to send message",
+        });
+    }
   }
 };
 
+/* -------------------------------------------------
+   GET MESSAGES
+--------------------------------------------------*/
 const getMessages = async (req, res) => {
   try {
     const myId = req.user._id;
@@ -58,7 +78,6 @@ const getMessages = async (req, res) => {
       ],
     };
 
-    // cursor-based pagination
     if (cursor) {
       query._id = { $lt: cursor };
     }
@@ -67,17 +86,17 @@ const getMessages = async (req, res) => {
       .sort({ _id: -1 })
       .limit(Number(limit));
 
-    // mark incoming messages as seen
-    await Message.updateMany(
-      {
-        sender: userId,
-        receiver: myId,
-        status: { $ne: "seen" },
-      },
-      { $set: { status: "seen" } }
-    );
-
-    
+    // Mark as seen (Only if fetching latest messages)
+    if (!cursor) {
+        await Message.updateMany(
+            {
+                sender: userId,
+                receiver: myId,
+                status: { $ne: "seen" },
+            },
+            { $set: { status: "seen" } }
+        );
+    }
 
     return res.json({
       success: true,

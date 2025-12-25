@@ -4,9 +4,10 @@ const getUsers = async (req, res) => {
   try {
     const currentUserId = req.user._id;
 
+    // FIX: Added 'publicKey' to the select string so the frontend can use it!
     const users = await User.find({
       _id: { $ne: currentUserId },
-    }).select("_id userName email");
+    }).select("_id userName email publicKey");
 
     return res.status(200).json({
       success: true,

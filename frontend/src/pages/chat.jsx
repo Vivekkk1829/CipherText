@@ -3,12 +3,16 @@ import { useOutletContext, useNavigate } from "react-router-dom";
 import api from "../api/axios";
 import { getSocket } from "../api/socket";
 
+// IMPORT SECURITY TOOLS
+import { encryptMessage, decryptMessage } from "../utils/crypto.js"
+
 export default function Chat() {
   const { user } = useOutletContext();
   const navigate = useNavigate();
 
   const chatRef = useRef(null);
   const lastMessageRef = useRef(null);
+  const profileRef = useRef(null);
 
   const [showMyProfile, setShowMyProfile] = useState(false);
 
@@ -26,9 +30,23 @@ export default function Chat() {
 
   /* ---------------- LOGOUT ---------------- */
   const handleLogout = async () => {
+    // Clear keys on logout for security
+    localStorage.removeItem("chat_private_key"); 
     await api.post("/auth/logout");
     navigate("/", { replace: true });
   };
+
+  /* ---------------- CLOSE PROFILE ON OUTSIDE CLICK ---------------- */
+  useEffect(() => {
+    const handleClickOutside = (e) => {
+      if (profileRef.current && !profileRef.current.contains(e.target)) {
+        setShowMyProfile(false);
+      }
+    };
+
+    document.addEventListener("mousedown", handleClickOutside);
+    return () => document.removeEventListener("mousedown", handleClickOutside);
+  }, []);
 
   /* ---------------- FETCH USERS ---------------- */
   useEffect(() => {
@@ -78,16 +96,34 @@ export default function Chat() {
     setLoadingMore(false);
   };
 
-  /* ---------------- SEND MESSAGE ---------------- */
+  /* ---------------- SEND MESSAGE (ENCRYPTED) ---------------- */
   const handleSendMessage = async () => {
     if (!messageText.trim()) return;
 
-    // ✅ ONLY HTTP persistence
+    // 1. Get Keys
+    const myPrivateKey = localStorage.getItem("chat_private_key");
+    const theirPublicKey = selectedUser?.publicKey;
+
+    if (!myPrivateKey || !theirPublicKey) {
+      alert("Security Error: Keys missing. Cannot send encrypted message.");
+      return;
+    }
+
+    // 2. Encrypt
+    // encryptMessage returns object: { content: "...", iv: "..." }
+    const encryptedData = encryptMessage(messageText, myPrivateKey, theirPublicKey);
+
+    if (!encryptedData) {
+        alert("Encryption failed");
+        return;
+    }
+
+    // 3. Send Ciphertext + IV to Backend
     await api.post(`/messages/${selectedUser._id}`, {
-      content: messageText,
+      content: encryptedData.content,
+      iv: encryptedData.iv
     });
 
-    // ✅ UI updates via socket ONLY
     setMessageText("");
   };
 
@@ -178,12 +214,12 @@ export default function Chat() {
             {selectedUser ? selectedUser.userName : "Select a chat"}
           </p>
 
-          <div
-            className="relative"
-            onMouseEnter={() => setShowMyProfile(true)}
-            onMouseLeave={() => setShowMyProfile(false)}
-          >
-            <div className="flex items-center gap-2 cursor-pointer">
+          {/* PROFILE DROPDOWN */}
+          <div className="relative" ref={profileRef}>
+            <div
+              className="flex items-center gap-2 cursor-pointer"
+              onClick={() => setShowMyProfile((prev) => !prev)}
+            >
               <div className="w-8 h-8 rounded-full bg-cyan-500 flex items-center justify-center text-slate-900 font-bold">
                 {user.userName.charAt(0).toUpperCase()}
               </div>
@@ -228,6 +264,31 @@ export default function Chat() {
                 const isMine = msg.sender === user._id;
                 const isLast = index === messages.length - 1;
 
+                /* ---------------- DECRYPTION LOGIC START ---------------- */
+                // We always need:
+                // 1. My Private Key (to unlock the secret)
+                // 2. The OTHER person's Public Key (to derive the secret)
+                
+                const myPrivateKey = localStorage.getItem("chat_private_key");
+                const theirPublicKey = selectedUser.publicKey; 
+                // Note: Even if 'isMine' is true, I used 'theirPublicKey' to encrypt it.
+                // So I need 'theirPublicKey' + 'myPrivateKey' to decrypt it.
+                // The math is symmetric: ECDH(PrivA, PubB) == ECDH(PrivB, PubA)
+
+                let displayText = "Loading...";
+                if (msg.isEncrypted && msg.iv) {
+                   displayText = decryptMessage(
+                      msg.content, 
+                      msg.iv, 
+                      myPrivateKey, 
+                      theirPublicKey
+                   );
+                } else {
+                   // Fallback for old unencrypted messages (if any)
+                   displayText = msg.content;
+                }
+                /* ---------------- DECRYPTION LOGIC END ---------------- */
+
                 return (
                   <div
                     key={msg._id}
@@ -237,13 +298,13 @@ export default function Chat() {
                     }`}
                   >
                     <div
-                      className={`px-4 py-2 rounded-lg max-w-md ${
+                      className={`px-4 py-2 rounded-lg max-w-md break-words ${
                         isMine
                           ? "bg-cyan-500 text-slate-900"
                           : "bg-slate-800"
                       }`}
                     >
-                      {msg.content}
+                      {displayText}
                     </div>
                   </div>
                 );

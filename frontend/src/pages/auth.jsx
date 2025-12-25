@@ -3,6 +3,12 @@ import api from "../api/axios.js";
 import { useNavigate } from "react-router-dom";
 
 
+import { 
+  generateKeyPair, 
+  encryptPrivateKey, 
+  decryptPrivateKey 
+} from "../utils/crypto.js"; 
+
 export default function Auth() {
   const [mode, setMode] = useState("signin");
   const navigate = useNavigate();
@@ -18,31 +24,62 @@ export default function Auth() {
     setForm({ ...form, [e.target.name]: e.target.value });
   };
 
+  /* -------------------------------------------------------------------------- */
+  /* SECURE SUBMIT LOGIC (MODIFIED)                                            */
+  /* -------------------------------------------------------------------------- */
   const handleSubmit = async (e) => {
     e.preventDefault();
     setError("");
     setLoading(true);
 
     try {
-      const endpoint =
-        mode === "signin" ? "/auth/login" : "/auth/register";
+      
+      if (mode === "signup") {
+        /* --- SIGN UP FLOW --- */
+        // 1. Generate Identity locally
+        const { publicKey, privateKey } = generateKeyPair();
 
-      const payload =
-        mode === "signin"
-          ? { email: form.email, password: form.password }
-          : form;
+        // 2. Encrypt the Private Key (The Vault)
+        const encryptedPrivateKey = encryptPrivateKey(privateKey, form.password);
 
-      const { data } = await api.post(endpoint, payload);
+        // 3. Send Vault + Identity to Server
+        const payload = {
+          ...form,
+          publicKey,
+          encryptedPrivateKey, 
+        };
 
-      console.log("AUTH SUCCESS:");
+        await api.post("/auth/register", payload);
+
+        // 4. Save Raw Key locally so user is logged in instantly
+        localStorage.setItem("chat_private_key", privateKey);
+
+      } else {
+        /* --- SIGN IN FLOW --- */
+        const payload = { email: form.email, password: form.password };
+        const { data } = await api.post("/auth/login", payload);
+
+        // 1. Get the Vault from the response
+        const { encryptedPrivateKey } = data.user;
+
+        // 2. Unlock the Vault
+        if (encryptedPrivateKey) {
+            const restoredPrivateKey = decryptPrivateKey(encryptedPrivateKey, form.password);
+            
+            if (restoredPrivateKey) {
+                localStorage.setItem("chat_private_key", restoredPrivateKey);
+            } else {
+                throw new Error("Security Error: Could not restore chat history keys.");
+            }
+        }
+      }
+
+      console.log("AUTH SUCCESS");
       navigate("/chat");
-
-
-    
 
     } catch (err) {
       setError(
-        err.response?.data?.message || "Authentication failed"
+        err.response?.data?.message || err.message || "Authentication failed"
       );
     } finally {
       setLoading(false);
@@ -183,7 +220,7 @@ export default function Auth() {
               "
             >
               {loading
-                ? "Please wait..."
+                ? "Processing Keys..."
                 : mode === "signin"
                 ? "Sign In"
                 : "Create Account"}
