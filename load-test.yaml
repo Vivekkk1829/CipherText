@@ -1,0 +1,35 @@
+config:
+  target: "http://localhost:8000"  # 👈 YOUR BACKEND URL
+  phases:
+    - duration: 60           # Run the test for 60 seconds
+      arrivalRate: 20        # Add 20 new users every second
+      # 20 users/sec * 60 sec = 1200 total users connected
+  engines:
+    socketio: {}
+
+scenarios:
+  - name: "Chat User Simulation"
+    engine: "socketio"
+    flow:
+      # 1. Connect and join (simulate user login/setup)
+      - emit:
+          channel: "setup"     # If you have a setup event, or just rely on connection
+          data: { userId: "test-user-{{ $randomString() }}" }
+
+      # 2. Wait a bit (simulate reading)
+      - think: 2
+
+      # 3. Simulate Typing
+      - emit:
+          channel: "typing"
+          data: { senderId: "load-tester", receiverId: "dummy-user" }
+      
+      - think: 1
+
+      # 4. Send a Message
+      - emit:
+          channel: "send_message"
+          data: { content: "Load test message!", senderId: "load-tester", receiverId: "dummy-user" }
+      
+      # 5. Keep connection open for a while
+      - think: 10

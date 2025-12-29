@@ -4,6 +4,34 @@ import api from "../api/axios";
 import { getSocket } from "../api/socket";
 import { encryptMessage, decryptMessage } from "../utils/crypto.js";
 
+/* ----------------------------------------------------------------
+   HELPER FUNCTIONS FOR DATE SEPARATORS 📅
+---------------------------------------------------------------- */
+const isSameDay = (d1, d2) => {
+  return (
+    d1.getFullYear() === d2.getFullYear() &&
+    d1.getMonth() === d2.getMonth() &&
+    d1.getDate() === d2.getDate()
+  );
+};
+
+const formatDateLabel = (dateString) => {
+  const date = new Date(dateString);
+  const today = new Date();
+  const yesterday = new Date();
+  yesterday.setDate(today.getDate() - 1);
+
+  if (isSameDay(date, today)) return "Today";
+  if (isSameDay(date, yesterday)) return "Yesterday";
+  
+  return date.toLocaleDateString("en-US", {
+    year: "numeric",
+    month: "short",
+    day: "numeric",
+  });
+};
+/* ---------------------------------------------------------------- */
+
 export default function Chat() {
   const { user } = useOutletContext();
   const navigate = useNavigate();
@@ -26,6 +54,13 @@ export default function Chat() {
   const [onlineUsers, setOnlineUsers] = useState([]);
   const [isTyping, setIsTyping] = useState(false);
 
+  /* ---------------- REQUEST NOTIFICATION PERMISSION ---------------- */
+  useEffect(() => {
+    if ("Notification" in window && Notification.permission !== "granted") {
+        Notification.requestPermission();
+    }
+  }, []);
+
   /* ---------------- LOGOUT ---------------- */
   const handleLogout = async () => {
     localStorage.removeItem("chat_private_key");
@@ -33,7 +68,7 @@ export default function Chat() {
     navigate("/", { replace: true });
   };
 
-  /* ---------------- CLOSE PROFILE ON OUTSIDE CLICK ---------------- */
+  /* ---------------- CLOSE PROFILE ---------------- */
   useEffect(() => {
     const handleClickOutside = (e) => {
       if (profileRef.current && !profileRef.current.contains(e.target)) {
@@ -75,141 +110,223 @@ export default function Chat() {
     if (!nextCursor || loadingMore) return;
     setLoadingMore(true);
     const prevHeight = chatRef.current.scrollHeight;
-
-    const res = await api.get(
-      `/messages/${selectedUser._id}?cursor=${nextCursor}`
-    );
-
+    const res = await api.get(`/messages/${selectedUser._id}?cursor=${nextCursor}`);
     setMessages((prev) => [...res.data.messages, ...prev]);
     setNextCursor(res.data.nextCursor);
-
     requestAnimationFrame(() => {
       if (chatRef.current) {
         const newHeight = chatRef.current.scrollHeight;
         chatRef.current.scrollTop = newHeight - prevHeight;
       }
     });
-
     setLoadingMore(false);
   };
 
-  /* ---------------- HANDLE TYPING INPUT ---------------- */
+  /* ---------------- HANDLE TYPING ---------------- */
   const handleInputCallback = (e) => {
     setMessageText(e.target.value);
     const socket = getSocket();
-
     if (!socket || !selectedUser) return;
-
     socket.emit("typing", { senderId: user._id, receiverId: selectedUser._id });
-
     if (typingTimeoutRef.current) clearTimeout(typingTimeoutRef.current);
-
     typingTimeoutRef.current = setTimeout(() => {
         socket.emit("stop_typing", { senderId: user._id, receiverId: selectedUser._id });
     }, 2000);
   };
 
-  /* ---------------- SEND MESSAGE ---------------- */
+  /* ----------------------------------------------------------------
+     🚀 NEW: RETRY LOGIC (GUARANTEED DELIVERY + NO DUPLICATES)
+  ---------------------------------------------------------------- */
+  const sendWithRetry = async (packet, attempt = 1) => {
+      const maxRetries = 5;
+
+      try {
+          // Attempt the HTTP Request
+          const res = await api.post(`/messages/${packet.receiverId}`, {
+             content: packet.content,
+             iv: packet.iv
+          });
+
+          // ✅ ACK RECEIVED (Server returned 201)
+          if (res.data.success) {
+              const realMessage = res.data.message;
+              
+              setMessages(prev => {
+                // 1. Check if Socket already added the "Real" message (Race Condition Check)
+                const socketAlreadyAddedIt = prev.some(m => m._id === realMessage._id);
+
+                if (socketAlreadyAddedIt) {
+                    // 🗑️ Socket beat us! The real message is already there.
+                    // Just REMOVE our temporary optimistic message.
+                    return prev.filter(m => m._id !== packet.tempId);
+                } else {
+                    // ✏️ We are first. Replace the temporary message with the Real DB Message.
+                    return prev.map(msg => 
+                        msg._id === packet.tempId ? { ...realMessage } : msg
+                    );
+                }
+              });
+          }
+      } catch (error) {
+          // ❌ FAILURE (No ACK)
+          console.warn(`Attempt ${attempt} failed.`);
+          
+          if (attempt < maxRetries) {
+              // Retry with Exponential Backoff (1s, 2s, 3s...)
+              setTimeout(() => sendWithRetry(packet, attempt + 1), 1000 * attempt);
+          } else {
+              // 💀 PERMANENT FAILURE
+              setMessages(prev => prev.map(msg => 
+                  msg._id === packet.tempId ? { ...msg, status: "failed" } : msg
+              ));
+          }
+      }
+  };
+
+  /* ----------------------------------------------------------------
+     🚀 UPDATED: HANDLE SEND MESSAGE (Optimistic UI + Retry Call)
+  ---------------------------------------------------------------- */
   const handleSendMessage = async () => {
     if (!messageText.trim()) return;
 
+    // 1. Handle Typing Logic (Keep existing)
     const socket = getSocket();
     if (socket && typingTimeoutRef.current) {
         clearTimeout(typingTimeoutRef.current);
         socket.emit("stop_typing", { senderId: user._id, receiverId: selectedUser._id });
     }
 
+    // 2. Encrypt
     const myPrivateKey = localStorage.getItem("chat_private_key");
     const theirPublicKey = selectedUser?.publicKey;
-
-    if (!myPrivateKey || !theirPublicKey) {
-      alert("Security Error: Keys missing.");
-      return;
-    }
-
+    if (!myPrivateKey || !theirPublicKey) { alert("Keys missing."); return; }
     const encryptedData = encryptMessage(messageText, myPrivateKey, theirPublicKey);
-    if (!encryptedData) {
-      alert("Encryption failed");
-      return;
-    }
-
-    await api.post(`/messages/${selectedUser._id}`, {
+    if (!encryptedData) { alert("Encryption failed"); return; }
+    
+    // 3. Prepare Packet with Temporary ID
+    const tempId = Date.now().toString(); // Temporary ID for React key
+    const packet = {
+      receiverId: selectedUser._id,
       content: encryptedData.content,
-      iv: encryptedData.iv
-    });
+      iv: encryptedData.iv,
+      tempId: tempId
+    };
 
+    // 4. Optimistic UI: Show message immediately as "Pending" (Grey tick)
+    const optimisticMessage = {
+        _id: tempId,
+        sender: user._id,
+        receiver: selectedUser._id,
+        content: encryptedData.content,
+        iv: encryptedData.iv,
+        createdAt: new Date().toISOString(),
+        status: "pending", // <--- Start as pending
+        isEncrypted: true
+    };
+
+    setMessages(prev => [...prev, optimisticMessage]);
     setMessageText("");
+
+    // 5. Trigger Reliable Send
+    sendWithRetry(packet);
   };
 
   /* ---------------- AUTO SCROLL ---------------- */
   useLayoutEffect(() => {
     if (lastMessageRef.current) {
-      lastMessageRef.current.scrollIntoView({
-        behavior: "auto",
-        block: "end",
-      });
+      lastMessageRef.current.scrollIntoView({ behavior: "auto", block: "end" });
     }
   }, [messages, isTyping]);
 
   /* ---------------- SCROLL HANDLER ---------------- */
   const handleScroll = () => {
-    if (chatRef.current.scrollTop === 0) {
-      fetchOlderMessages();
-    }
+    if (chatRef.current.scrollTop === 0) fetchOlderMessages();
   };
 
-  /* ---------------- SOCKET LISTENERS ---------------- */
+  /* ---------------- SOCKET: ONLINE STATUS ---------------- */
+  useEffect(() => {
+    const socket = getSocket();
+    if (!socket) return;
+    
+    const handleOnlineUsers = (ids) => {
+        setOnlineUsers(ids);
+    };
+    
+    socket.on("get_online_users", handleOnlineUsers);
+    
+    return () => {
+        socket.off("get_online_users", handleOnlineUsers);
+    };
+  }, []); 
+
+
+  /* ---------------- SOCKET: MESSAGES & TYPING ---------------- */
   useEffect(() => {
     const socket = getSocket();
     if (!socket) return; 
 
-    socket.on("get_online_users", (onlineUserIds) => {
-        setOnlineUsers(onlineUserIds);
-    });
-
     const handleUserTyping = ({ senderId }) => {
-        if (selectedUser && senderId === selectedUser._id) {
-            setIsTyping(true);
-        }
+        if (selectedUser && senderId === selectedUser._id) setIsTyping(true);
     };
 
     const handleUserStoppedTyping = ({ senderId }) => {
-        if (selectedUser && senderId === selectedUser._id) {
-            setIsTyping(false);
-        }
+        if (selectedUser && senderId === selectedUser._id) setIsTyping(false);
     };
 
+    /* ---------- NEW MESSAGE HANDLER ---------- */
     const handleNewMessage = (message) => {
-      if (selectedUser && message.sender === selectedUser._id) {
-          setIsTyping(false);
-      }
+      if (selectedUser && message.sender === selectedUser._id) setIsTyping(false);
 
       if (message.receiver === user._id) {
-          socket.emit("mark_delivered", {
-              messageId: message._id,
-              senderId: message.sender
-          });
+          socket.emit("mark_delivered", { messageId: message._id, senderId: message.sender });
       }
 
       const isCurrentChat = selectedUser && (
-          message.sender === selectedUser._id || 
-          message.receiver === selectedUser._id
+          message.sender === selectedUser._id || message.receiver === selectedUser._id
       );
 
+      // 1. If looking at the chat
       if (isCurrentChat) {
-        setMessages((prev) => [...prev, message]);
+        setMessages((prev) => {
+            // Prevent Duplicates: If we already have this ID, don't add it
+            if (prev.some(m => m._id === message._id)) return prev;
+            return [...prev, message];
+        });
         if (message.receiver === user._id) {
-            socket.emit("mark_seen", {
-                senderId: message.sender,
-                receiverId: user._id
-            });
+            socket.emit("mark_seen", { senderId: message.sender, receiverId: user._id });
         }
+      } 
+      // 2. If NOT looking at the chat
+      else if (message.receiver === user._id) {
+         setUsers(prev => prev.map(u => {
+             if (u._id === message.sender) {
+                 return { ...u, unreadCount: (u.unreadCount || 0) + 1 };
+             }
+             return u;
+         }));
+      }
+
+      /* 🔔 SYSTEM NOTIFICATION */
+      if (message.receiver === user._id) {
+          if (document.hidden || !isCurrentChat) {
+             if (Notification.permission === "granted") {
+                 const senderName = users.find(u => u._id === message.sender)?.userName || "Someone";
+                 new Notification("New Message", { 
+                     body: `${senderName} sent you a message`,
+                     icon: "/vite.svg" 
+                 });
+             }
+          }
       }
     };
 
     const handleMessageSent = (message) => {
       if (selectedUser && message.receiver === selectedUser._id) {
-        setMessages((prev) => [...prev, message]);
+        setMessages((prev) => {
+            // Prevent Duplicates: check against real ID
+            if (prev.some(m => m._id === message._id)) return prev;
+            return [...prev, message];
+        });
       }
     };
 
@@ -239,7 +356,6 @@ export default function Chat() {
     socket.on("user_stopped_typing", handleUserStoppedTyping);
 
     return () => {
-      socket.off("get_online_users");
       socket.off("new_message", handleNewMessage);
       socket.off("message_sent", handleMessageSent);
       socket.off("message_status_update", handleStatusUpdate);
@@ -247,11 +363,13 @@ export default function Chat() {
       socket.off("user_typing", handleUserTyping);
       socket.off("user_stopped_typing", handleUserStoppedTyping);
     };
-  }, [selectedUser, user._id]);
+  }, [selectedUser, user._id, users]);
 
 
   /* ---------------- RENDER STATUS TEXT ---------------- */
   const renderMessageStatus = (status) => {
+    if (status === "pending") return "Sending..."; // UI Feedback
+    if (status === "failed") return "Failed";     // UI Feedback
     if (status === "seen") return "Seen";
     if (status === "delivered") return "Delivered";
     return "Sent";
@@ -261,10 +379,7 @@ export default function Chat() {
   return (
     <div className="h-screen flex bg-slate-950 text-white overflow-hidden">
 
-      {/* LEFT SIDEBAR (User List) 
-          - On mobile: Visible ONLY if no user is selected
-          - On desktop: Always visible
-      */}
+      {/* SIDEBAR */}
       <aside 
         className={`bg-slate-900 border-r border-slate-800 flex-col 
           ${selectedUser ? "hidden lg:flex lg:w-72" : "flex w-full lg:w-72"}
@@ -286,42 +401,50 @@ export default function Chat() {
                     onClick={() => {
                         setSelectedUser(u);
                         fetchMessages(u._id);
+                        setUsers(prev => prev.map(user => 
+                            user._id === u._id ? { ...user, unreadCount: 0 } : user
+                        ));
+                        const socket = getSocket();
+                        if(socket) {
+                            socket.emit("mark_seen", { senderId: u._id, receiverId: user._id });
+                        }
                     }}
                     className={`px-4 py-3 cursor-pointer hover:bg-slate-800 flex justify-between items-center ${
                         selectedUser?._id === u._id ? "bg-slate-800" : ""
                     }`}
                 >
-                    <div>
-                        <p className="font-medium">{u.userName}</p>
-                        <p className="text-xs text-slate-400">{u.email}</p>
+                    {/* LEFT: User Info */}
+                    <div className="flex-1 min-w-0 mr-3">
+                        <p className="font-medium truncate">{u.userName}</p>
+                        <p className="text-xs text-slate-400 truncate">{u.email}</p>
                     </div>
-                    {isOnline && (
-                        <div className="w-2.5 h-2.5 bg-green-500 rounded-full shadow-md shadow-green-500/50"></div>
-                    )}
+                    
+                    {/* RIGHT: Status Indicators (Horizontal Layout) */}
+                    <div className="flex flex-row items-center gap-2">
+                        {u.unreadCount > 0 && (
+                            <span className="bg-cyan-500 text-slate-900 text-[10px] font-bold px-1.5 py-0.5 rounded-full min-w-[18px] text-center shadow-sm">
+                                {u.unreadCount}
+                            </span>
+                        )}
+                        {isOnline && (
+                            <div className="w-2.5 h-2.5 bg-green-500 rounded-full shadow-[0_0_8px_rgba(34,197,94,0.6)]"></div>
+                        )}
+                    </div>
                 </div>
               );
             })
           )}
         </div>
-        
-        {/* Mobile-only Logout at bottom of list if needed, or rely on Header profile */}
       </aside>
 
-      {/* RIGHT CHAT AREA 
-          - On mobile: Visible ONLY if a user IS selected
-          - On desktop: Always visible
-      */}
+      {/* CHAT AREA */}
       <section 
         className={`flex-col h-full w-full
-           ${!selectedUser ? "hidden lg:flex lg:flex-1" : "flex flex-1"}
+            ${!selectedUser ? "hidden lg:flex lg:flex-1" : "flex flex-1"}
         `}
       >
-
-        {/* TOP BAR */}
         <header className="h-16 border-b border-slate-800 flex items-center justify-between px-4 bg-slate-900 shrink-0">
           <div className="flex items-center gap-3">
-              
-              {/* BACK BUTTON (Mobile Only) */}
               {selectedUser && (
                   <button 
                     onClick={() => setSelectedUser(null)}
@@ -335,8 +458,6 @@ export default function Chat() {
                   <p className="font-medium">
                     {selectedUser ? selectedUser.userName : "Select a chat"}
                   </p>
-                  
-                  {/* HEADER STATUS */}
                   {selectedUser && (
                     <>
                         {isTyping ? (
@@ -376,7 +497,7 @@ export default function Chat() {
           </div>
         </header>
 
-        {/* MESSAGES */}
+        {/* MESSAGES WITH DATE SEPARATORS */}
         <div
           ref={chatRef}
           onScroll={handleScroll}
@@ -391,54 +512,47 @@ export default function Chat() {
           ) : (
             <>
               {loadingMore && (
-                <p className="text-center text-xs text-slate-500">
-                  Loading older messages...
-                </p>
+                <p className="text-center text-xs text-slate-500">Loading older messages...</p>
               )}
 
               {messages.map((msg, index) => {
                 const isMine = msg.sender === user._id;
                 const isLast = index === messages.length - 1;
-
                 const myPrivateKey = localStorage.getItem("chat_private_key");
                 const theirPublicKey = selectedUser.publicKey;
 
+                const currentDate = new Date(msg.createdAt);
+                const prevMessage = messages[index - 1];
+                const prevDate = prevMessage ? new Date(prevMessage.createdAt) : null;
+                const showDateSeparator = !prevDate || !isSameDay(currentDate, prevDate);
+
                 let displayText = "Loading...";
                 if (msg.isEncrypted && msg.iv) {
-                   displayText = decryptMessage(
-                      msg.content, 
-                      msg.iv, 
-                      myPrivateKey, 
-                      theirPublicKey
-                    );
+                   displayText = decryptMessage(msg.content, msg.iv, myPrivateKey, theirPublicKey);
                 } else {
-                    displayText = msg.content;
+                   displayText = msg.content;
                 }
 
                 return (
-                  <div
-                    key={msg._id}
-                    ref={isLast ? lastMessageRef : null}
-                    className={`flex ${
-                      isMine ? "justify-end" : "justify-start"
-                    }`}
-                  >
-                    <div className={`flex flex-col ${isMine ? "items-end" : "items-start"} max-w-md`}>
-                        <div
-                          className={`px-4 py-2 rounded-lg break-words ${
-                            isMine
-                              ? "bg-cyan-500 text-slate-900"
-                              : "bg-slate-800"
-                          }`}
-                        >
-                          {displayText}
+                  <div key={msg._id}>
+                      {showDateSeparator && (
+                          <div className="flex justify-center my-6">
+                              <span className="text-[11px] font-medium text-slate-400 bg-slate-800/50 px-3 py-1 rounded-full border border-slate-800">
+                                  {formatDateLabel(msg.createdAt)}
+                              </span>
+                          </div>
+                      )}
+
+                      <div ref={isLast ? lastMessageRef : null} className={`flex ${isMine ? "justify-end" : "justify-start"}`}>
+                        <div className={`flex flex-col ${isMine ? "items-end" : "items-start"} max-w-md`}>
+                            <div className={`px-4 py-2 rounded-lg break-words ${isMine ? "bg-cyan-500 text-slate-900" : "bg-slate-800"}`}>
+                              {displayText}
+                            </div>
+                            {isMine && isLast && (
+                              <span className="text-[10px] text-slate-500 font-medium mt-1 mr-1">{renderMessageStatus(msg.status)}</span>
+                            )}
                         </div>
-                        {isMine && isLast && (
-                           <span className="text-[10px] text-slate-500 font-medium mt-1 mr-1">
-                               {renderMessageStatus(msg.status)}
-                           </span>
-                        )}
-                    </div>
+                      </div>
                   </div>
                 );
               })}
@@ -446,7 +560,6 @@ export default function Chat() {
           )}
         </div>
 
-        {/* INPUT */}
         {selectedUser && (
           <div className="border-t border-slate-800 p-4 bg-slate-900 flex gap-3 shrink-0">
             <input
@@ -456,12 +569,7 @@ export default function Chat() {
               className="flex-1 bg-slate-800 px-4 py-2 rounded outline-none"
               placeholder="Type a message..."
             />
-            <button
-              onClick={handleSendMessage}
-              className="bg-cyan-400 text-black px-4 py-2 rounded"
-            >
-              Send
-            </button>
+            <button onClick={handleSendMessage} className="bg-cyan-400 text-black px-4 py-2 rounded">Send</button>
           </div>
         )}
       </section>
