@@ -5,6 +5,20 @@ import { getSocket } from "../api/socket";
 import { encryptMessage, decryptMessage } from "../utils/crypto.js";
 
 /* ----------------------------------------------------------------
+   🟢 NEW: SESSION UUID GENERATOR
+   This creates a unique ID for this specific browser session.
+   If the user refreshes, this changes, resetting the sequence logic safely.
+---------------------------------------------------------------- */
+const generateSessionUUID = () => {
+  if (typeof crypto !== 'undefined' && crypto.randomUUID) {
+    return crypto.randomUUID();
+  }
+  return 'sess-' + Math.random().toString(36).substr(2, 9) + Date.now().toString(36);
+};
+
+const SESSION_UUID = generateSessionUUID(); 
+
+/* ----------------------------------------------------------------
    HELPER FUNCTIONS FOR DATE SEPARATORS 📅
 ---------------------------------------------------------------- */
 const isSameDay = (d1, d2) => {
@@ -40,6 +54,11 @@ export default function Chat() {
   const lastMessageRef = useRef(null);
   const profileRef = useRef(null);
   const typingTimeoutRef = useRef(null);
+
+  // 🟢 NEW: SEQUENCE TRACKER
+  // Stores the last sequence number used for each chat partner.
+  // Format: { "user_id_A": 5, "user_id_B": 12 }
+  const clientSequenceRefs = useRef({});
 
   const [showMyProfile, setShowMyProfile] = useState(false);
   const [users, setUsers] = useState([]);
@@ -92,6 +111,16 @@ export default function Chat() {
     fetchUsers();
   }, []);
 
+  /* ---------------- HELPER: GET NEXT CLIENT ID ---------------- */
+  // 🟢 NEW function to manage the counter
+  const getNextClientId = (receiverId) => {
+    if (!clientSequenceRefs.current[receiverId]) {
+      clientSequenceRefs.current[receiverId] = 0;
+    }
+    clientSequenceRefs.current[receiverId] += 1;
+    return clientSequenceRefs.current[receiverId];
+  };
+
   /* ---------------- FETCH MESSAGES ---------------- */
   const fetchMessages = async (userId) => {
     setLoadingMessages(true);
@@ -135,8 +164,8 @@ export default function Chat() {
   };
 
   /* ----------------------------------------------------------------
-     🚀 NEW: RETRY LOGIC (GUARANTEED DELIVERY + NO DUPLICATES)
-  ---------------------------------------------------------------- */
+     🚀 RETRY LOGIC (UPDATED WITH NEW FIELDS)
+   ---------------------------------------------------------------- */
   const sendWithRetry = async (packet, attempt = 1) => {
       const maxRetries = 5;
 
@@ -144,23 +173,22 @@ export default function Chat() {
           // Attempt the HTTP Request
           const res = await api.post(`/messages/${packet.receiverId}`, {
              content: packet.content,
-             iv: packet.iv
+             iv: packet.iv,
+             // 🟢 NEW: Send the Ordering Data
+             clientId: packet.clientId,
+             clientUuid: packet.clientUuid
           });
 
-          // ✅ ACK RECEIVED (Server returned 201)
+          // ✅ ACK RECEIVED
           if (res.data.success) {
               const realMessage = res.data.message;
               
               setMessages(prev => {
-                // 1. Check if Socket already added the "Real" message (Race Condition Check)
                 const socketAlreadyAddedIt = prev.some(m => m._id === realMessage._id);
 
                 if (socketAlreadyAddedIt) {
-                    // 🗑️ Socket beat us! The real message is already there.
-                    // Just REMOVE our temporary optimistic message.
                     return prev.filter(m => m._id !== packet.tempId);
                 } else {
-                    // ✏️ We are first. Replace the temporary message with the Real DB Message.
                     return prev.map(msg => 
                         msg._id === packet.tempId ? { ...realMessage } : msg
                     );
@@ -168,14 +196,12 @@ export default function Chat() {
               });
           }
       } catch (error) {
-          // ❌ FAILURE (No ACK)
+          // ❌ FAILURE
           console.warn(`Attempt ${attempt} failed.`);
           
           if (attempt < maxRetries) {
-              // Retry with Exponential Backoff (1s, 2s, 3s...)
               setTimeout(() => sendWithRetry(packet, attempt + 1), 1000 * attempt);
           } else {
-              // 💀 PERMANENT FAILURE
               setMessages(prev => prev.map(msg => 
                   msg._id === packet.tempId ? { ...msg, status: "failed" } : msg
               ));
@@ -184,12 +210,12 @@ export default function Chat() {
   };
 
   /* ----------------------------------------------------------------
-     🚀 UPDATED: HANDLE SEND MESSAGE (Optimistic UI + Retry Call)
-  ---------------------------------------------------------------- */
+     🚀 HANDLE SEND MESSAGE (UPDATED)
+   ---------------------------------------------------------------- */
   const handleSendMessage = async () => {
     if (!messageText.trim()) return;
 
-    // 1. Handle Typing Logic (Keep existing)
+    // 1. Handle Typing Logic
     const socket = getSocket();
     if (socket && typingTimeoutRef.current) {
         clearTimeout(typingTimeoutRef.current);
@@ -203,16 +229,23 @@ export default function Chat() {
     const encryptedData = encryptMessage(messageText, myPrivateKey, theirPublicKey);
     if (!encryptedData) { alert("Encryption failed"); return; }
     
-    // 3. Prepare Packet with Temporary ID
-    const tempId = Date.now().toString(); // Temporary ID for React key
+    // 3. 🟢 GET ORDERING IDS
+    const clientId = getNextClientId(selectedUser._id);
+    const clientUuid = SESSION_UUID;
+
+    // 4. Prepare Packet with Temporary ID
+    const tempId = Date.now().toString();
     const packet = {
       receiverId: selectedUser._id,
       content: encryptedData.content,
       iv: encryptedData.iv,
-      tempId: tempId
+      tempId: tempId,
+      // 🟢 Attach to packet
+      clientId: clientId,
+      clientUuid: clientUuid
     };
 
-    // 4. Optimistic UI: Show message immediately as "Pending" (Grey tick)
+    // 5. Optimistic UI
     const optimisticMessage = {
         _id: tempId,
         sender: user._id,
@@ -220,14 +253,14 @@ export default function Chat() {
         content: encryptedData.content,
         iv: encryptedData.iv,
         createdAt: new Date().toISOString(),
-        status: "pending", // <--- Start as pending
+        status: "pending", 
         isEncrypted: true
     };
 
     setMessages(prev => [...prev, optimisticMessage]);
     setMessageText("");
 
-    // 5. Trigger Reliable Send
+    // 6. Trigger Reliable Send
     sendWithRetry(packet);
   };
 

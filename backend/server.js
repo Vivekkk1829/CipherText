@@ -3,6 +3,7 @@ const connectDB = require("./db/index.js");
 const { Server } = require("socket.io");
 const http = require("http");
 const Message = require("./models/Message.js"); 
+require("./db/redis.js");
 
 dotenv.config();
 const app = require("./app.js");
