@@ -1,116 +1,155 @@
 const Message = require("../models/Message.js");
+const Conversation = require("../models/Conversation.js");
+const getConversationId = require("../utils/getConversationId.js");
 
 /* -------------------------------------------------
-   SEND MESSAGE
+   SEND MESSAGE (Updates Server ID & Client ID)
 --------------------------------------------------*/
 const sendMessage = async (req, res) => {
   try {
-    const sender = req.user._id;
-    // Safety Check: Handle both :id and :userId param names
+    const sender = req.user._id.toString();
     const receiver = req.params.userId || req.params.id;
-    const { content, iv } = req.body;
+    const { content, iv, clientSeq } = req.body;
 
-    if (!content || !content.trim()) {
-      return res.status(400).json({ success: false, message: "Message content is required" });
+    // if (Number(clientSeq) % 10 === 0) {
+    //   console.log(`🐢 Simulating lag for message #${clientSeq}...`);
+    //   await new Promise((resolve) => setTimeout(resolve, 10000));
+    // }
+
+    if (!content || !iv || clientSeq === undefined) {
+      return res
+        .status(400)
+        .json({ success: false, message: "Missing fields" });
     }
 
-    if (!iv) {
-        return res.status(400).json({ success: false, message: "Encryption IV is missing." });
-    }
+    const customConversationId = getConversationId(sender, receiver);
 
+    // 1. UPDATE CONVERSATION STATE
+    // - Increment Server ID (+1)
+    // - Update Sender's Client ID (to whatever you sent, e.g., 501)
+    const conversation = await Conversation.findOneAndUpdate(
+      { conversationId: customConversationId },
+      {
+        $setOnInsert: { conversationId: customConversationId },
+        $inc: { lastSequenceId: 1 }, // Server Logic (1000 -> 1001)
+        $set: { [`participantCounters.${sender}`]: Number(clientSeq) }, // Client Logic (500 -> 501)
+      },
+      { new: true, upsert: true, setDefaultsOnInsert: true }
+    );
+
+    // 2. SAVE MESSAGE
     const message = await Message.create({
+      conversationId: conversation._id,
       sender,
       receiver,
       content,
       iv,
+      sequenceId: conversation.lastSequenceId, // Server ID (e.g., 1001)
+      clientSeq: Number(clientSeq), // Client ID (e.g., 501)
       type: "text",
       status: "sent",
       isEncrypted: true,
+    });
+
+    await Conversation.findByIdAndUpdate(conversation._id, {
+      lastMessage: message._id,
     });
 
     res.status(201).json({ success: true, message });
 
     const io = req.app.get("io");
     if (io) {
-        // Emit to Receiver (User B)
-        io.to(receiver.toString()).emit("new_message", message);
-        // Emit to Sender (User A)
-        io.to(sender.toString()).emit("message_sent", message);
+      io.to(receiver.toString()).emit("new_message", message);
+      io.to(sender.toString()).emit("message_sent", message);
     }
-
   } catch (error) {
     console.error("Send message error:", error);
-    if (!res.headersSent) return res.status(500).json({ success: false, message: "Failed to send message" });
+    if (!res.headersSent)
+      return res.status(500).json({ success: false, message: "Failed" });
   }
 };
 
 /* -------------------------------------------------
-   GET MESSAGES
+   GET MESSAGES (Returns Client Sequences)
 --------------------------------------------------*/
 const getMessages = async (req, res) => {
   try {
-    const myId = req.user._id;
-    // FIX: Standardize ID extraction like in sendMessage
+    const myId = req.user._id.toString();
     const userId = req.params.userId || req.params.id;
     const { limit = 20, cursor } = req.query;
 
+    const customConversationId = getConversationId(myId, userId);
+
+    const conversation = await Conversation.findOne({
+      conversationId: customConversationId,
+    });
+
+    if (!conversation) {
+      console.log("❌ Conversation Document NOT Found");
+      return res.status(200).json({
+        success: true,
+        messages: [],
+        lastServerSeq: 0,
+        myLastClientSeq: 0,
+        theirLastClientSeq: 0,
+      });
+    }
+
     // ---------------------------------------------------------
-    // STEP 1: MARK AS SEEN (On Load)
+    // 🔥 EXTRACT THE CLIENT SEQUENCES
     // ---------------------------------------------------------
-    // If loading the chat for the first time (no cursor), mark unread messages as seen.
+    // 1. My Last Seq: So I know to send (501 + 1) = 502 next.
+    const myLastClientSeq = conversation.participantCounters
+      ? conversation.participantCounters.get(myId) || 0
+      : 0;
+
+    // 2. Their Last Seq: So I know if I should wait for a missing message.
+    const theirLastClientSeq = conversation.participantCounters
+      ? conversation.participantCounters.get(userId) || 0
+      : 0;
+
+    // Standard "Mark as Seen"
     if (!cursor) {
-        const updateResult = await Message.updateMany(
-            {
-                sender: userId, // Sent BY the other person
-                receiver: myId, // To ME
-                status: { $ne: "seen" }, // Not yet seen
-            },
-            { $set: { status: "seen" } }
-        );
-
-        // Notify the Sender (User A) instantly via Socket
-        if (updateResult.modifiedCount > 0) {
-            const io = req.app.get("io");
-            if (io) {
-                io.to(userId.toString()).emit("messages_seen_update", {
-                    conversationId: myId, 
-                    status: "seen"
-                });
-            }
-        }
+      const updateResult = await Message.updateMany(
+        {
+          conversationId: conversation._id,
+          sender: userId,
+          status: { $ne: "seen" },
+        },
+        { $set: { status: "seen" } }
+      );
+      if (updateResult.modifiedCount > 0) {
+        const io = req.app.get("io");
+        if (io)
+          io.to(userId.toString()).emit("messages_seen_update", {
+            conversationId: myId,
+            status: "seen",
+          });
+      }
     }
 
-    // ---------------------------------------------------------
-    // STEP 2: FETCH MESSAGES
-    // ---------------------------------------------------------
-    const query = {
-      $or: [
-        { sender: myId, receiver: userId },
-        { sender: userId, receiver: myId },
-      ],
-    };
-
-    if (cursor) {
-      query._id = { $lt: cursor };
-    }
+    // Fetch Messages
+    let query = { conversationId: conversation._id };
+    if (cursor) query._id = { $lt: cursor };
 
     const messages = await Message.find(query)
-      .sort({ _id: -1 })
+      .sort({ sequenceId: -1 })
       .limit(Number(limit));
 
     return res.json({
       success: true,
       messages: messages.reverse(),
       nextCursor: messages.length ? messages[0]._id : null,
-    });
 
+      // ✅ RETURN ALL 3 CRITICAL NUMBERS
+      lastServerSeq: conversation.lastSequenceId,
+      myLastClientSeq: myLastClientSeq,
+      theirLastClientSeq: theirLastClientSeq,
+    });
   } catch (error) {
     console.error("Get messages error:", error);
-    return res.status(500).json({ success: false, message: "Failed to fetch messages" });
+    return res.status(500).json({ success: false, message: "Failed" });
   }
 };
 
-module.exports = {
-  sendMessage,
-  getMessages,
-};
+module.exports = { sendMessage, getMessages };
