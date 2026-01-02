@@ -16,6 +16,7 @@ const isSameDay = (d1, d2) => {
 };
 
 const formatDateLabel = (dateString) => {
+  if (!dateString) return ""; 
   const date = new Date(dateString);
   const today = new Date();
   const yesterday = new Date();
@@ -31,19 +32,25 @@ const formatDateLabel = (dateString) => {
   });
 };
 
-/* ----------------------------------------------------------------
-   🔥 HISTORY SORTER (Client Seq Only)
-   Sorts purely by ClientSeq for the same user.
-   Uses Timestamp only to interleave User A vs User B.
----------------------------------------------------------------- */
-const sortHistoryStrict = (msgs) => {
+/* 🔥 FIXED SORTING HELPER 🔥 */
+/* Prioritizes Date first. Uses Sequence only as a tie-breaker. */
+const sortMessages = (msgs) => {
     return [...msgs].sort((a, b) => {
-        // 1. Same User? Strict Client Sequence.
-        if (a.sender === b.sender) {
+        const dateA = a.createdAt ? new Date(a.createdAt).getTime() : 0;
+        const dateB = b.createdAt ? new Date(b.createdAt).getTime() : 0;
+
+        // 1. Primary Sort: Always respect Time first
+        if (dateA !== dateB) {
+            return dateA - dateB;
+        }
+
+        // 2. Secondary Sort: Tie-breaker for same millisecond
+        // (Only strictly order by sequence if times are identical)
+        if (a.sender === b.sender && a.clientSeq && b.clientSeq) {
             return a.clientSeq - b.clientSeq;
         }
-        // 2. Different Users? Timestamp (Arrival Time).
-        return new Date(a.createdAt) - new Date(b.createdAt);
+
+        return 0;
     });
 };
 
@@ -56,9 +63,13 @@ export default function Chat() {
   const profileRef = useRef(null);
   const typingTimeoutRef = useRef(null);
 
-  // 🛡️ ORDERING STATE
-  const expectedSeqRef = useRef(0);   // Next expected number from THEM (e.g. 500)
-  const bufferRef = useRef({});       // Buffer: { 501: msg, 502: msg }
+  const expectedSeqRef = useRef(0);   
+  const bufferRef = useRef({});       
+  const pendingStatusUpdatesRef = useRef({}); 
+  
+  // 🆕 TIMER REF for Gap Skimming
+  const gapTimeoutRef = useRef(null);
+
   const [myClientSeq, setMyClientSeq] = useState(0);
 
   const [showMyProfile, setShowMyProfile] = useState(false);
@@ -111,26 +122,69 @@ export default function Chat() {
     fetchUsers();
   }, []);
 
-  /* ----------------------------------------------------------------
-     🔥 PROCESS INCOMING (Real-time Buffering)
-  ---------------------------------------------------------------- */
+  /* ---------------- GAP RECOVERY ---------------- */
+  const executeGapRecovery = async () => {
+      if (!selectedUser) return;
+      console.warn("Gap Timer Expired. Executing Recovery Fetch...");
+
+      try {
+          const res = await api.get(`/messages/${selectedUser._id}`);
+          const serverMessages = res.data.messages;
+
+          setMessages(prev => {
+              // Merge & Deduplicate
+              const combined = [...prev, ...serverMessages];
+              const unique = combined.filter((v,i,a)=>a.findIndex(t=>(t._id === v._id))===i);
+              return sortMessages(unique);
+          });
+
+          // Sync Sequence
+          const lastSeen = res.data.theirLastClientSeq || 0;
+          if (lastSeen >= expectedSeqRef.current) {
+              expectedSeqRef.current = lastSeen + 1;
+          }
+
+          // Cleanup
+          bufferRef.current = {};
+          if (gapTimeoutRef.current) {
+              clearTimeout(gapTimeoutRef.current);
+              gapTimeoutRef.current = null;
+          }
+      } catch (err) {
+          console.error("Gap recovery failed:", err);
+      }
+  };
+
+  /* ---------------- PROCESS INCOMING ---------------- */
   const processRealTimeMessage = (msg) => {
-      // 1. If it's ME -> Pass through immediately
       if (msg.sender === user._id) return [msg];
 
-      // 2. If it's THEM -> Check Sequence
       const incoming = msg.clientSeq;
       const expected = expectedSeqRef.current;
       const validBatch = [];
 
       console.log(`Processing #${incoming}. Expecting #${expected}`);
 
+      // 🛑 1. BOUNDS CHECK: Gap too huge? (> 50)
+      if (incoming - expected > 50) {
+          console.warn("Gap > 50. Forcing full reload.");
+          if (gapTimeoutRef.current) clearTimeout(gapTimeoutRef.current);
+          fetchMessages(selectedUser._id);
+          return [];
+      }
+
       if (incoming === expected) {
           // ✅ Exact match
           validBatch.push(msg);
           let next = incoming + 1;
+          
+          // 🛑 2. SUCCESS: Cancel Gap Timer
+          if (gapTimeoutRef.current) {
+              clearTimeout(gapTimeoutRef.current);
+              gapTimeoutRef.current = null;
+          }
 
-          // ♻️ Flush Buffer (Check for 501, 502...)
+          // ♻️ Flush Buffer
           while (bufferRef.current[next]) {
               console.log(`Flushing buffered #${next}`);
               validBatch.push(bufferRef.current[next]);
@@ -140,15 +194,27 @@ export default function Chat() {
           expectedSeqRef.current = next;
       } 
       else if (incoming > expected) {
-          // ⚠️ Gap detected. Buffer it.
+          // ⚠️ Gap detected -> Buffer it
           console.warn(`Gap! Got #${incoming}, need #${expected}. Buffering.`);
           bufferRef.current[incoming] = msg;
-          // Return empty array (don't show yet)
+
+          // 🛑 3. BUFFER CHECK: Too many items? (> 10)
+          if (Object.keys(bufferRef.current).length > 10) {
+              executeGapRecovery();
+              return [];
+          }
+
+          // 🛑 4. START TIMER: Wait 5 seconds
+          if (!gapTimeoutRef.current) {
+              gapTimeoutRef.current = setTimeout(() => {
+                  executeGapRecovery();
+              }, 5000);
+          }
       } 
       else {
-          console.log(`Duplicate/Old #${incoming}`);
+          // ⚠️ OLD MESSAGE
+          validBatch.push(msg);
       }
-
       return validBatch;
   };
 
@@ -159,43 +225,54 @@ export default function Chat() {
     setNextCursor(null);
     setIsTyping(false);
     
-    // RESET STRICT ORDERING STATE
     setMyClientSeq(0);
     expectedSeqRef.current = 0;
     bufferRef.current = {};
+    pendingStatusUpdatesRef.current = {}; 
+    
+    // Cleanup Timer
+    if (gapTimeoutRef.current) {
+        clearTimeout(gapTimeoutRef.current);
+        gapTimeoutRef.current = null;
+    }
 
     const res = await api.get(`/messages/${userId}`);
     
-    // 1. Sort History strictly by ClientSeq
-    const sortedHistory = sortHistoryStrict(res.data.messages);
+    const sortedHistory = sortMessages(res.data.messages);
     setMessages(sortedHistory);
     setNextCursor(res.data.nextCursor);
     
-    // 2. Sync My Counter
+    // Sync Delivery Status
+    const socket = getSocket();
+    if (socket) {
+        res.data.messages.forEach(msg => {
+            if (msg.receiver === user._id && msg.status !== 'seen' && msg.status !== 'delivered') {
+                socket.emit("mark_delivered", { messageId: msg._id, senderId: msg.sender });
+            }
+        });
+    }
+    
     if (res.data.myLastClientSeq) {
         setMyClientSeq(res.data.myLastClientSeq);
     }
 
-    // 3. Sync Their Counter (For Buffering)
     const lastSeen = res.data.theirLastClientSeq || 0;
     expectedSeqRef.current = lastSeen + 1;
 
-    console.log(`History Loaded. Waiting for incoming #${expectedSeqRef.current}`);
     setLoadingMessages(false);
   };
 
-  /* ---------------- FETCH OLDER MESSAGES ---------------- */
   const fetchOlderMessages = async () => {
     if (!nextCursor || loadingMore) return;
     setLoadingMore(true);
     const prevHeight = chatRef.current.scrollHeight;
     
     const res = await api.get(`/messages/${selectedUser._id}?cursor=${nextCursor}`);
+    // Combine and Sort
+    const combined = [...res.data.messages, ...messages];
+    const sorted = sortMessages(combined); 
     
-    // Sort older chunk strictly too
-    const sortedChunk = sortHistoryStrict(res.data.messages);
-    
-    setMessages((prev) => [...sortedChunk, ...prev]);
+    setMessages(sorted);
     setNextCursor(res.data.nextCursor);
     
     requestAnimationFrame(() => {
@@ -222,6 +299,11 @@ export default function Chat() {
   /* ---------------- SEND RETRY ---------------- */
   const sendWithRetry = async (packet, attempt = 1) => {
       const maxRetries = 5;
+      
+      setMessages(prev => prev.map(msg => 
+          msg._id === packet.tempId ? { ...msg, status: "pending" } : msg
+      ));
+
       try {
           const res = await api.post(`/messages/${packet.receiverId}`, {
              content: packet.content,
@@ -231,10 +313,18 @@ export default function Chat() {
 
           if (res.data.success) {
               const realMessage = res.data.message;
+
+              if (pendingStatusUpdatesRef.current[realMessage._id]) {
+                  realMessage.status = pendingStatusUpdatesRef.current[realMessage._id];
+                  delete pendingStatusUpdatesRef.current[realMessage._id];
+              }
+
               setMessages(prev => {
                 const exists = prev.some(m => m._id === realMessage._id);
                 if (exists) return prev.filter(m => m._id !== packet.tempId);
-                return prev.map(msg => msg._id === packet.tempId ? { ...realMessage } : msg);
+                
+                const updated = prev.map(msg => msg._id === packet.tempId ? { ...realMessage } : msg);
+                return sortMessages(updated);
               });
           }
       } catch (error) {
@@ -265,7 +355,6 @@ export default function Chat() {
     const encryptedData = encryptMessage(messageText, myPrivateKey, theirPublicKey);
     if (!encryptedData) { alert("Encryption failed"); return; }
     
-    // Increment MY Sequence
     const nextSeq = myClientSeq + 1;
     setMyClientSeq(nextSeq);
 
@@ -288,13 +377,19 @@ export default function Chat() {
         createdAt: new Date().toISOString(),
         status: "pending", 
         isEncrypted: true,
-        clientSeq: nextSeq
+        clientSeq: nextSeq,
+        retryPacket: packet 
     };
 
-    setMessages(prev => [...prev, optimisticMessage]);
+    setMessages(prev => sortMessages([...prev, optimisticMessage]));
     setMessageText("");
 
     sendWithRetry(packet);
+  };
+  
+  const handleManualRetry = (msg) => {
+      if (!msg.retryPacket) return; 
+      sendWithRetry(msg.retryPacket);
   };
 
   useLayoutEffect(() => {
@@ -324,17 +419,19 @@ export default function Chat() {
       );
 
       if (isCurrentChat) {
-        // 🔥 PASS THROUGH BUFFERING LOGIC
         const validMessages = processRealTimeMessage(message);
 
         if (validMessages.length > 0) {
             setMessages((prev) => {
-                // Filter duplicates
-                const unique = validMessages.filter(n => !prev.some(p => p._id === n._id));
-                return [...prev, ...unique];
+                const uniqueIds = validMessages.filter(n => !prev.some(p => p._id === n._id));
+                const trulyNew = uniqueIds.filter(n => {
+                    const alreadyHasSeq = prev.some(p => p.sender === n.sender && p.clientSeq === n.clientSeq);
+                    return !alreadyHasSeq;
+                });
+                if (trulyNew.length === 0) return prev;
+                return sortMessages([...prev, ...trulyNew]);
             });
 
-            // Mark seen for shown messages
             if (message.receiver === user._id) {
                 socket.emit("mark_seen", { senderId: message.sender, receiverId: user._id });
             }
@@ -372,19 +469,37 @@ export default function Chat() {
         if (selectedUser && message.receiver === selectedUser._id) {
           setMessages((prev) => {
               if (prev.some(m => m._id === message._id)) return prev;
-              return [...prev, message];
+              
+              if (pendingStatusUpdatesRef.current[message._id]) {
+                  message.status = pendingStatusUpdatesRef.current[message._id];
+                  delete pendingStatusUpdatesRef.current[message._id];
+              }
+              return sortMessages([...prev, message]);
           });
         }
     };
-    const handleStatusUpdate = ({ messageId, status }) => {
-        setMessages(prev => prev.map(msg => {
-            if (msg._id === messageId) {
-                if (msg.status === "seen" && status === "delivered") return msg;
-                return { ...msg, status };
+    
+    const handleStatusUpdate = (payload) => {
+        const { messageId, _id, status } = payload;
+        const targetId = messageId || _id;
+
+        setMessages(prev => {
+            const exists = prev.some(m => m._id === targetId);
+            if (exists) {
+                return prev.map(msg => {
+                    if (msg._id === targetId) {
+                        if (msg.status === "seen" && status === "delivered") return msg;
+                        return { ...msg, status };
+                    }
+                    return msg;
+                });
+            } else {
+                pendingStatusUpdatesRef.current[targetId] = status;
+                return prev;
             }
-            return msg;
-        }));
+        });
     };
+
     const handleMessagesSeen = ({ conversationId, status }) => {
         if (selectedUser && conversationId == selectedUser._id) { 
             setMessages(prev => prev.map(msg => 
@@ -412,17 +527,59 @@ export default function Chat() {
       socket.off("user_typing", handleUserTyping);
       socket.off("user_stopped_typing", handleUserStoppedTyping);
       socket.off("get_online_users", handleOnlineUsers);
+      
+      if (gapTimeoutRef.current) clearTimeout(gapTimeoutRef.current);
     };
   }, [selectedUser, user._id, users]); 
 
 
-  /* ---------------- RENDER UI ---------------- */
-  const renderMessageStatus = (status) => {
-    if (status === "pending") return "Sending..."; 
-    if (status === "failed") return "Failed";     
-    if (status === "seen") return "Seen";
-    if (status === "delivered") return "Delivered";
-    return "Sent";
+  /* ---------------- UI RENDER ---------------- */
+  const renderMessageStatus = (status, msg) => {
+    if (status === "failed") {
+        return (
+            <button 
+                onClick={() => handleManualRetry(msg)}
+                className="w-4 h-4 rounded-full bg-red-500 flex items-center justify-center hover:bg-red-400 transition-colors shadow-sm"
+                title="Retry"
+            >
+                <span className="text-[10px] text-white font-bold">↻</span>
+            </button>
+        );
+    }
+    
+    if (status === "pending") {
+        return (
+             <div className="w-4 h-4 rounded-full border border-slate-500 flex items-center justify-center" title="Sending...">
+                <div className="w-2 h-[1px] bg-slate-500 rotate-45"></div>
+             </div>
+        );
+    }
+
+    if (status === "sent") {
+        return (
+             <div className="w-4 h-4 rounded-full bg-slate-700 flex items-center justify-center border border-slate-600" title="Sent">
+                <span className="text-[9px] text-slate-300">✓</span>
+             </div>
+        );
+    }
+    
+    if (status === "delivered") {
+         return (
+             <div className="w-4 h-4 rounded-full bg-slate-700 flex items-center justify-center border border-slate-600" title="Delivered">
+                <span className="text-[9px] text-slate-300 tracking-tighter">✓✓</span>
+             </div>
+        );
+    }
+    
+    if (status === "seen") {
+         return (
+             <div className="w-4 h-4 rounded-full bg-slate-700 flex items-center justify-center border border-cyan-500/30" title="Seen">
+                <span className="text-[9px] text-cyan-400 tracking-tighter shadow-[0_0_5px_rgba(34,211,238,0.4)]">✓✓</span>
+             </div>
+        );
+    }
+    
+    return null;
   };
 
   return (
@@ -502,9 +659,15 @@ export default function Chat() {
                   <div key={msg._id}>
                       {showDateSeparator && <div className="flex justify-center my-6"><span className="text-[11px] font-medium text-slate-400 bg-slate-800/50 px-3 py-1 rounded-full border border-slate-800">{formatDateLabel(msg.createdAt)}</span></div>}
                       <div ref={isLast ? lastMessageRef : null} className={`flex ${isMine ? "justify-end" : "justify-start"}`}>
-                        <div className={`flex flex-col ${isMine ? "items-end" : "items-start"} max-w-md`}>
-                            <div className={`px-4 py-2 rounded-lg break-words ${isMine ? "bg-cyan-500 text-slate-900" : "bg-slate-800"}`}>{displayText}</div>
-                            {isMine && isLast && <span className="text-[10px] text-slate-500 font-medium mt-1 mr-1">{renderMessageStatus(msg.status)}</span>}
+                        <div className={`flex items-end gap-2 max-w-md ${isMine ? "flex-row" : "flex-row"}`}>
+                            <div className={`px-4 py-2 rounded-lg break-words ${isMine ? "bg-cyan-500 text-slate-900" : "bg-slate-800"}`}>
+                                {displayText}
+                            </div>
+                            {isMine && (
+                                <div className="shrink-0 mb-1">
+                                    {renderMessageStatus(msg.status, msg)}
+                                </div>
+                            )}
                         </div>
                       </div>
                   </div>

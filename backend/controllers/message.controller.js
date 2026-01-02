@@ -11,10 +11,10 @@ const sendMessage = async (req, res) => {
     const receiver = req.params.userId || req.params.id;
     const { content, iv, clientSeq } = req.body;
 
-    // if (Number(clientSeq) % 10 === 0) {
-    //   console.log(`🐢 Simulating lag for message #${clientSeq}...`);
-    //   await new Promise((resolve) => setTimeout(resolve, 10000));
-    // }
+    if (Number(clientSeq) % 10 === 0) {
+      console.log(`🐢 Simulating lag for message #${clientSeq}...`);
+      await new Promise((resolve) => setTimeout(resolve, 10000));
+    }
 
     if (!content || !iv || clientSeq === undefined) {
       return res
