@@ -2,7 +2,7 @@ const dotenv = require("dotenv");
 const connectDB = require("./db/index.js");
 const { Server } = require("socket.io");
 const http = require("http");
-const Message = require("./models/Message.js"); 
+const Message = require("./models/Message.js");
 
 dotenv.config();
 const app = require("./app.js");
@@ -24,7 +24,7 @@ connectDB()
     // GLOBAL ONLINE USERS MAP 🌍
     // key = userId, value = socketId
     // -------------------------------------------------
-    const userSocketMap = {}; 
+    const userSocketMap = {};
 
     io.on("connection", (socket) => {
       console.log("Socket Connected", socket.id);
@@ -34,13 +34,13 @@ connectDB()
       if (userId) {
         // 1. Add User to Map
         userSocketMap[userId] = socket.id;
-        
+
         // 2. Add User to their own Room (for private msgs)
         socket.join(userId.toString());
-        
+
         // 3. BROADCAST ONLINE USERS TO EVERYONE 🟢
         io.emit("get_online_users", Object.keys(userSocketMap));
-        
+
         console.log(`User ${userId} joined room`);
       }
 
@@ -50,7 +50,7 @@ connectDB()
       socket.on("mark_delivered", async ({ messageId, senderId }) => {
         try {
           await Message.updateOne(
-            { _id: messageId, status: "sent" }, 
+            { _id: messageId, status: "sent" },
             { $set: { status: "delivered" } }
           );
 
@@ -69,19 +69,18 @@ connectDB()
       socket.on("mark_seen", async ({ senderId, receiverId }) => {
         try {
           await Message.updateMany(
-            { 
-              sender: senderId, 
-              receiver: receiverId, 
-              status: { $ne: "seen" } 
-            }, 
+            {
+              sender: senderId,
+              receiver: receiverId,
+              status: { $ne: "seen" },
+            },
             { $set: { status: "seen" } }
           );
 
           io.to(senderId).emit("messages_seen_update", {
-            conversationId: receiverId, 
-            status: "seen"
+            conversationId: receiverId,
+            status: "seen",
           });
-          
         } catch (error) {
           console.error("Error marking seen:", error);
         }
@@ -105,15 +104,21 @@ connectDB()
       socket.on("disconnect", () => {
         console.log("Socket Disconnected", socket.id);
         if (userId) {
-            delete userSocketMap[userId];
-            // Broadcast the updated list to everyone
-            io.emit("get_online_users", Object.keys(userSocketMap));
+          delete userSocketMap[userId];
+          // Broadcast the updated list to everyone
+          io.emit("get_online_users", Object.keys(userSocketMap));
         }
       });
     });
 
-    server.listen(process.env.PORT || 8000, () => {
-      console.log(`App running successfully on PORT ${process.env.PORT}`);
+    const PORT = Number(process.env.PORT);
+
+    if (!PORT) {
+      throw new Error("PORT is not defined");
+    }
+
+    server.listen(PORT, "0.0.0.0", () => {
+      console.log(`App running successfully on PORT ${PORT}`);
     });
   })
   .catch((err) => {
