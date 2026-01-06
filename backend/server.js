@@ -1,11 +1,12 @@
 const dotenv = require("dotenv");
+dotenv.config();
+
 const connectDB = require("./db/index.js");
 const { Server } = require("socket.io");
 const http = require("http");
 const Message = require("./models/Message.js"); 
 const app = require("./app.js");
 
-dotenv.config();
 
 
 connectDB()
